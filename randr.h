@@ -13,5 +13,6 @@ extern Rect *xr_resolutions;
 
 void randr_init(int *event_base, xcb_window_t root);
 void randr_query(xcb_window_t root);
+void randr_cleanup(void);
 
 #endif

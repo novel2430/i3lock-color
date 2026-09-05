@@ -66,11 +66,15 @@
 #define TSTAMP_N_SECS(n) (n * 1.0)
 #define TSTAMP_N_MINS(n) (60 * TSTAMP_N_SECS(n))
 #define START_TIMER(timer_obj, timeout, callback) \
-    timer_obj = start_timer(timer_obj, timeout, callback)
+    start_timer(&(timer_obj), timeout, callback)
 #define STOP_TIMER(timer_obj) \
-    timer_obj = stop_timer(timer_obj)
+    stop_timer(&(timer_obj))
 
 typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
+typedef struct {
+    ev_timer watcher;
+    bool initialized;
+} managed_timer_t;
 static void input_done(void);
 
 char color[9] = "a3a3a3ff";
@@ -225,9 +229,11 @@ bool unlock_indicator = true;
 char *modifier_string = NULL;
 static bool dont_fork = false;
 struct ev_loop *main_loop;
-static struct ev_timer *clear_auth_wrong_timeout;
-static struct ev_timer *clear_indicator_timeout;
-static struct ev_timer *discard_passwd_timeout;
+static bool screen_configuration_dirty;
+static managed_timer_t clear_auth_wrong_timeout;
+static managed_timer_t clear_indicator_timeout;
+static managed_timer_t discard_passwd_timeout;
+static managed_timer_t keypress_feedback_timeout;
 extern unlock_state_t unlock_state;
 extern auth_state_t auth_state;
 int failed_attempts = 0;
@@ -294,6 +300,7 @@ char* cmd_power_sleep = NULL;
 
 // for the rendering thread, so we can clean it up
 pthread_t draw_thread;
+static bool draw_thread_started = false;
 // main thread still sometimes calls redraw()
 // allow you to disable. handy if you use bar with lots of crap.
 bool redraw_thread = false;
@@ -502,29 +509,18 @@ static void clear_password_memory(void) {
 #endif
 }
 
-ev_timer *start_timer(ev_timer *timer_obj, ev_tstamp timeout, ev_callback_t callback) {
-    if (timer_obj) {
-        ev_timer_stop(main_loop, timer_obj);
-        ev_timer_set(timer_obj, timeout, 0.);
-        ev_timer_start(main_loop, timer_obj);
-    } else {
-        /* When there is no memory, we just don’t have a timeout. We cannot
-         * exit() here, since that would effectively unlock the screen. */
-        timer_obj = calloc(sizeof(struct ev_timer), 1);
-        if (timer_obj) {
-            ev_timer_init(timer_obj, callback, timeout, 0.);
-            ev_timer_start(main_loop, timer_obj);
-        }
-    }
-    return timer_obj;
+static void start_timer(managed_timer_t *timer, ev_tstamp timeout, ev_callback_t callback) {
+    if (timer->initialized && ev_is_active(&timer->watcher))
+        ev_timer_stop(main_loop, &timer->watcher);
+
+    ev_timer_init(&timer->watcher, callback, timeout, 0.);
+    timer->initialized = true;
+    ev_timer_start(main_loop, &timer->watcher);
 }
 
-ev_timer *stop_timer(ev_timer *timer_obj) {
-    if (timer_obj) {
-        ev_timer_stop(main_loop, timer_obj);
-        free(timer_obj);
-    }
-    return NULL;
+static void stop_timer(managed_timer_t *timer) {
+    if (timer->initialized && ev_is_active(&timer->watcher))
+        ev_timer_stop(main_loop, &timer->watcher);
 }
 
 /*
@@ -534,7 +530,6 @@ ev_timer *stop_timer(ev_timer *timer_obj) {
 static void finish_input(void) {
     password[input_position] = '\0';
     unlock_state = STATE_KEY_PRESSED;
-    redraw_screen();
     input_done();
 }
 
@@ -546,7 +541,7 @@ static void finish_input(void) {
 static void clear_auth_wrong(EV_P_ ev_timer *w, int revents) {
     DEBUG("clearing auth wrong\n");
     auth_state = STATE_AUTH_IDLE;
-    redraw_screen();
+    request_redraw();
 
     /* Clear modifier string. */
     if (modifier_string != NULL) {
@@ -581,6 +576,7 @@ static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
 }
 
 static void input_done(void) {
+    STOP_TIMER(keypress_feedback_timeout);
     STOP_TIMER(clear_auth_wrong_timeout);
     auth_state = STATE_AUTH_VERIFY;
     unlock_state = STATE_STARTED;
@@ -665,7 +661,7 @@ static void input_done(void) {
     failed_attempts += 1;
     clear_input();
     if (unlock_indicator)
-        redraw_screen();
+        request_redraw();
 
     /* Clear this state after 2 seconds (unless the user enters another
      * password during that time). */
@@ -683,9 +679,9 @@ static void input_done(void) {
     }
 }
 
-static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
-    redraw_screen();
-    STOP_TIMER(w);
+static void keypress_feedback_cb(EV_P_ ev_timer *w, int revents) {
+    request_redraw();
+    STOP_TIMER(keypress_feedback_timeout);
 }
 
 static bool skip_without_validation(void) {
@@ -924,6 +920,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             if ((ksym == XKB_KEY_u && ctrl) ||
                 ksym == XKB_KEY_Escape) {
                 DEBUG("C-u pressed\n");
+                STOP_TIMER(keypress_feedback_timeout);
                 clear_input();
                 /* Also hide the unlock indicator */
                 if (unlock_indicator)
@@ -946,6 +943,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
                 break;
 
             if (input_position == 0) {
+                STOP_TIMER(keypress_feedback_timeout);
                 START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
                 unlock_state = STATE_NOTHING_TO_DELETE;
                 redraw_screen();
@@ -953,6 +951,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             }
 
             /* decrement input_position to point to the previous glyph */
+            STOP_TIMER(keypress_feedback_timeout);
             u8_dec(password, &input_position);
             password[input_position] = '\0';
 
@@ -992,8 +991,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
         redraw_screen();
         unlock_state = STATE_KEY_PRESSED;
 
-        struct ev_timer *timeout = NULL;
-        START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
+        START_TIMER(keypress_feedback_timeout, TSTAMP_N_SECS(0.25), keypress_feedback_cb);
         STOP_TIMER(clear_indicator_timeout);
     }
 
@@ -1072,7 +1070,7 @@ static void process_xkb_event(xcb_generic_event_t *gevent) {
                   layout_text = NULL;
             }
             layout_text = get_keylayoutname(keylayout_mode, conn);
-            redraw_screen();
+            request_redraw();
             break;
     }
 }
@@ -1083,32 +1081,29 @@ static void process_xkb_event(xcb_generic_event_t *gevent) {
  * and also redraw the image, if any.
  *
  */
-static void handle_screen_resize(void) {
+static void handle_screen_resize(bool monitor_layout_changed) {
     xcb_get_geometry_cookie_t geomc;
     xcb_get_geometry_reply_t *geom;
     geomc = xcb_get_geometry(conn, screen->root);
     if ((geom = xcb_get_geometry_reply(conn, geomc, 0)) == NULL)
         return;
 
-    if (last_resolution[0] == geom->width &&
-        last_resolution[1] == geom->height) {
-        free(geom);
-        return;
+    const bool framebuffer_changed =
+        last_resolution[0] != geom->width || last_resolution[1] != geom->height;
+    if (framebuffer_changed) {
+        last_resolution[0] = geom->width;
+        last_resolution[1] = geom->height;
     }
-
-    last_resolution[0] = geom->width;
-    last_resolution[1] = geom->height;
 
     free(geom);
 
-    redraw_screen();
+    if (framebuffer_changed) {
+        uint32_t mask = XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT;
+        xcb_configure_window(conn, win, mask, last_resolution);
+    }
 
-    uint32_t mask = XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT;
-    xcb_configure_window(conn, win, mask, last_resolution);
-    xcb_flush(conn);
-
-    randr_query(screen->root);
-    redraw_screen();
+    if (framebuffer_changed || monitor_layout_changed)
+        screen_configuration_dirty = true;
 }
 
 static ssize_t read_raw_image_native(uint32_t *dest, FILE *src, size_t width, size_t height, int pixstride) {
@@ -1164,13 +1159,24 @@ static const struct raw_pixel_format raw_fmt_bgr = {3, 2, 1, 0};
 static const struct raw_pixel_format raw_fmt_bgrx = {4, 2, 1, 0};
 static const struct raw_pixel_format raw_fmt_xbgr = {4, 3, 2, 1};
 
+static void destroy_gif_images(void) {
+    if (!gif_img)
+        return;
+    for (int i = 0; i < gif_img_count; i++) {
+        if (gif_img[i].img)
+            cairo_surface_destroy(gif_img[i].img);
+    }
+    free(gif_img);
+    gif_img = NULL;
+    gif_img_count = 0;
+}
+
 static cairo_surface_t *read_gif_image(const char *image_path) {
     int err;
     int width, stride, height;
     int bg_idx;
     uint32_t bg_color;
     ColorMapObject *cmap;
-    GraphicsControlBlock gc;
 
     /* Open and load a GIF file */
     GifFileType *gif = DGifOpenFileName(image_path, &err);
@@ -1188,8 +1194,11 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
     height = gif->SHeight;
     cmap = gif->SColorMap;
     bg_idx = gif->SBackGroundColor;
-    GifColorType *cmap_bg_rgb = cmap->Colors + bg_idx;
-    bg_color = cmap_bg_rgb->Blue | cmap_bg_rgb->Green << 8 | cmap_bg_rgb->Red << 16;
+    bg_color = 0;
+    if (cmap && bg_idx >= 0 && bg_idx < cmap->ColorCount) {
+        GifColorType *cmap_bg_rgb = cmap->Colors + bg_idx;
+        bg_color = cmap_bg_rgb->Blue | cmap_bg_rgb->Green << 8 | cmap_bg_rgb->Red << 16;
+    }
     stride = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, width) / sizeof(uint32_t);
     if (stride < 0) {
         fprintf(stderr, "Invalid distance between beginning of rows\n");
@@ -1197,12 +1206,14 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
     }
 
     /* Read the images into the RGB buffers */
-    gif_img = malloc(gif->ImageCount * sizeof(struct gif));
-    gif_img_count = gif->ImageCount;
+    if (gif->ImageCount <= 0)
+        goto read_gif_image_clean;
+    gif_img = calloc(gif->ImageCount, sizeof(struct gif));
     if (!gif_img) {
         fprintf(stderr, "Could not allocate memory for GIF image buffers\n");
         goto read_gif_image_clean;
     }
+    gif_img_count = gif->ImageCount;
     uint32_t *data_prev = NULL;
     for (SavedImage *pimg = gif->SavedImages; pimg < gif->SavedImages + gif->ImageCount; ++pimg) {
         int idx = pimg - gif->SavedImages;
@@ -1211,8 +1222,7 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
         if (cairo_surface_status(gif_img[idx].img) != CAIRO_STATUS_SUCCESS) {
             fprintf(stderr, "Could not create surface: %s\n",
                     cairo_status_to_string(cairo_surface_status(gif_img[idx].img)));
-            free(gif_img);
-            gif_img = NULL;
+            destroy_gif_images();
             goto read_gif_image_clean;
         }
         cairo_surface_flush(gif_img[idx].img);
@@ -1220,6 +1230,10 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
 
         // TODO: Check L,R,W,H && color map?
         /* Find Graphics Control extension and delay */
+        GraphicsControlBlock gc = {
+            .DisposalMode = DISPOSAL_UNSPECIFIED,
+            .TransparentColor = NO_TRANSPARENT_COLOR,
+        };
         for (int iext = 0; iext < pimg->ExtensionBlockCount; ++iext) {
             ExtensionBlock *pext = pimg->ExtensionBlocks + iext;
             switch (pext->Function) {
@@ -1236,6 +1250,11 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
         /* Set general image attributes */
         ColorMapObject *cmap_img = pimg->ImageDesc.ColorMap;
         if (!cmap_img) cmap_img = cmap;
+        if (!cmap_img) {
+            fprintf(stderr, "GIF frame has no color map\n");
+            destroy_gif_images();
+            goto read_gif_image_clean;
+        }
         int img_left = pimg->ImageDesc.Left;
         int img_width = pimg->ImageDesc.Width;
         int img_right = img_left + img_width;
@@ -1243,7 +1262,7 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
         int img_bottom = img_top + pimg->ImageDesc.Height;
 
         /* Handle disposal mode */
-        int data_size = width * height * ((int)sizeof(width));
+        int data_size = width * height * (int)sizeof(uint32_t);
         switch (gc.DisposalMode) {
             case DISPOSE_DO_NOT:
                 if (data_prev) {
@@ -1269,7 +1288,8 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
                     color_idx = *(pimg->RasterBits + (x - img_left) + ((y - img_top) * img_width));
                 }
 
-                if (color_idx != gc.TransparentColor) {
+                if (color_idx != gc.TransparentColor &&
+                    color_idx >= 0 && color_idx < cmap_img->ColorCount) {
                     GifColorType *cmap_rgb = cmap_img->Colors + color_idx;
                     uint32_t rgb = cmap_rgb->Blue | cmap_rgb->Green << 8 | cmap_rgb->Red << 16;
                     data[x + (y*width)] = rgb;
@@ -1286,7 +1306,7 @@ read_gif_image_clean:
         DEBUG("DGifCloseFile call failed, (Error %d)\n", err);
     }
 
-    return gif_img[0].img;
+    return gif_img_count > 0 ? gif_img[0].img : NULL;
 }
 
 static cairo_surface_t *read_raw_image(const char *image_path, const char *image_raw_format) {
@@ -1504,6 +1524,7 @@ static void xcb_got_event(EV_P_ struct ev_io *w, int revents) {
  *
  */
 static void xcb_prepare_cb(EV_P_ ev_prepare *w, int revents) {
+    redraw_if_needed();
     xcb_flush(conn);
 }
 
@@ -1572,7 +1593,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 break;
 
             case XCB_CONFIGURE_NOTIFY:
-                handle_screen_resize();
+                handle_screen_resize(false);
                 break;
 
             default:
@@ -1580,14 +1601,21 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                     process_xkb_event(event);
                 }
                 if (randr_base > -1 &&
-                    type == randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
-                    randr_query(screen->root);
-                    handle_screen_resize();
+                    (type == randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY ||
+                     type == randr_base + XCB_RANDR_NOTIFY)) {
+                    handle_screen_resize(true);
                 }
         }
 
         free(event);
     }
+    if (screen_configuration_dirty) {
+        screen_configuration_dirty = false;
+        randr_query(screen->root);
+        renderer_update_monitors();
+        request_redraw();
+    }
+    redraw_if_needed();
 }
 
 /*
@@ -1645,46 +1673,60 @@ static void raise_loop(xcb_window_t window) {
     }
 }
 
-/*
- * Loads an image from the given path. Handles JPEG and PNG. Returns NULL in case of error.
- */
-cairo_surface_t *load_image(enum IMAGE_FORMAT format) {
+static cairo_user_data_key_t image_data_key;
+
+/* Loads one image and attaches externally allocated JPEG pixels to its surface. */
+static cairo_surface_t *load_image_from_path(enum IMAGE_FORMAT format, const char *path) {
     cairo_surface_t *img = NULL;
     JPEG_INFO jpg_info;
-    unsigned char *jpg_data;
+    unsigned char *jpg_data = NULL;
 
     switch (format) {
         case IMAGE_FORMAT_RAW:
             /* Read image. 'read_raw_image' returns NULL on error,
              * so we don't have to handle errors here. */
-            img = read_raw_image(image_path, image_raw_format);
+            img = read_raw_image(path, image_raw_format);
             break;
         case IMAGE_FORMAT_PNG:
-            img = cairo_image_surface_create_from_png(image_path);
+            img = cairo_image_surface_create_from_png(path);
             break;
         case IMAGE_FORMAT_JPG:
-            jpg_data = read_JPEG_file(image_path, &jpg_info);
+            jpg_data = read_JPEG_file(path, &jpg_info);
             if (jpg_data != NULL) {
                 img = cairo_image_surface_create_for_data(jpg_data,
                                                           CAIRO_FORMAT_ARGB32, jpg_info.width, jpg_info.height,
                                                           jpg_info.stride);
+                if (cairo_surface_status(img) == CAIRO_STATUS_SUCCESS) {
+                    if (cairo_surface_set_user_data(img, &image_data_key, jpg_data, free) == CAIRO_STATUS_SUCCESS) {
+                        jpg_data = NULL;
+                    } else {
+                        cairo_surface_destroy(img);
+                        img = NULL;
+                    }
+                }
             }
             break;
         case IMAGE_FORMAT_GIF:
-            img = read_gif_image(image_path);
+            img = read_gif_image(path);
             break;
         default:
-            fprintf(stderr, "Unsupported image file format: %s\n", image_path);
+            fprintf(stderr, "Unsupported image file format: %s\n", path);
     }
 
     /* In case loading failed, we just pretend no -i was specified. */
     if (img && cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
         fprintf(stderr, "Could not load image, %s\n",
                 cairo_status_to_string(cairo_surface_status(img)));
+        cairo_surface_destroy(img);
         img = NULL;
     }
+    free(jpg_data);
 
     return img;
+}
+
+cairo_surface_t *load_image_path(const char *path) {
+    return load_image_from_path(verify_image(path), path);
 }
 
 /*
@@ -1696,6 +1738,10 @@ bool load_slideshow_images(const char *path) {
     DIR *d;
     struct dirent *dir;
     int file_count = 0;
+    for (int i = 0; i < slideshow_image_count; i++) {
+        free(img_slideshow[i]);
+        img_slideshow[i] = NULL;
+    }
     slideshow_image_count = 0;
 
     DEBUG("Loading slideshow images at \"%s\"\n", path);
@@ -1710,6 +1756,7 @@ bool load_slideshow_images(const char *path) {
 
     if (regcomp(&reg, ".*\\.(jpe?g|png)", REG_EXTENDED)) {
         printf("Could not compile regex\n");
+        closedir(d);
         return false;
     }
 
@@ -1718,14 +1765,7 @@ bool load_slideshow_images(const char *path) {
         int result = regexec(&reg, dir->d_name, 0, NULL, 0);
         if (result) continue;
 
-        char path_to_image[256];
-        strcpy(path_to_image, path);
-        strcat(path_to_image, "/");
-        strcat(path_to_image, dir->d_name);
-
-        img_slideshow[file_count] = strdup(path_to_image);
-
-        if (img_slideshow[file_count] != NULL) {
+        if (asprintf(&img_slideshow[file_count], "%s/%s", path, dir->d_name) != -1) {
             ++file_count;
         }
     }
@@ -1733,7 +1773,7 @@ bool load_slideshow_images(const char *path) {
     slideshow_image_count = file_count;
     regfree(&reg);
     closedir(d);
-    return true;
+    return file_count > 0;
 }
 
 void gif_anim_loop(struct ev_loop *loop, struct ev_timer *timer, int delay) {
@@ -1742,7 +1782,8 @@ void gif_anim_loop(struct ev_loop *loop, struct ev_timer *timer, int delay) {
     if (++img_count >= gif_img_count) img_count = 0;
     img = gif_img[img_count].img;
     ev_timer_stop(loop, timer);
-    redraw_screen();
+    renderer_invalidate_background();
+    request_redraw();
     ev_timer_set(timer, gif_img[img_count].delay_sec, 0.);
     ev_timer_start(loop, timer);
 }
@@ -2744,13 +2785,14 @@ int main(int argc, char *argv[]) {
     if (image_path != NULL) {
         if (!is_directory(image_path)) {
             enum IMAGE_FORMAT image_format = verify_image(image_path);
-            img = load_image(image_format);
+            img = load_image_from_path(image_format, image_path);
         } else {
             /* Path to a directory is provided -> use slideshow mode */
             slideshow_path = strdup(image_path);
+            if (slideshow_path == NULL)
+                err(EXIT_FAILURE, "strdup");
             if (!load_slideshow_images(slideshow_path)) exit(EXIT_FAILURE);
-            enum IMAGE_FORMAT image_format = verify_image(img_slideshow[0]);
-            img = load_image(image_format);
+            img = load_image_path(img_slideshow[0]);
         }
         free(image_path);
     }
@@ -2777,10 +2819,8 @@ int main(int argc, char *argv[]) {
     /* Open the fullscreen window, already with the correct pixmap in place */
     win = open_fullscreen_window(conn, screen, color);
 
-    xcb_pixmap_t pixmap = create_bg_pixmap(conn, win, last_resolution, color);
-    render_lock(last_resolution, pixmap);
-    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[]){pixmap});
-    xcb_free_pixmap(conn, pixmap);
+    initialize_renderer();
+    redraw_screen();
 
     cursor = create_cursor(conn, screen, win, curs_choice);
 
@@ -2831,43 +2871,91 @@ int main(int argc, char *argv[]) {
     auth_state = STATE_AUTH_IDLE;
     redraw_screen();
 
-    struct ev_io *xcb_watcher = calloc(sizeof(struct ev_io), 1);
-    struct ev_check *xcb_check = calloc(sizeof(struct ev_check), 1);
-    struct ev_prepare *xcb_prepare = calloc(sizeof(struct ev_prepare), 1);
-    struct ev_timer *xcb_timer = calloc(sizeof(struct ev_timer), 1);
+    struct ev_io xcb_watcher;
+    struct ev_check xcb_check;
+    struct ev_prepare xcb_prepare;
+    struct ev_timer gif_timer;
+    bool gif_timer_started = false;
 
-    ev_io_init(xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn), EV_READ);
-    ev_io_start(main_loop, xcb_watcher);
+    ev_io_init(&xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn), EV_READ);
+    ev_io_start(main_loop, &xcb_watcher);
 
-    ev_check_init(xcb_check, xcb_check_cb);
-    ev_check_start(main_loop, xcb_check);
+    ev_check_init(&xcb_check, xcb_check_cb);
+    ev_check_start(main_loop, &xcb_check);
 
-    ev_prepare_init(xcb_prepare, xcb_prepare_cb);
-    ev_prepare_start(main_loop, xcb_prepare);
+    ev_prepare_init(&xcb_prepare, xcb_prepare_cb);
+    ev_prepare_start(main_loop, &xcb_prepare);
 
     if (gif_img) {
-        ev_timer_init(xcb_timer, gif_anim_loop, gif_img[0].delay_sec, 0.);
-        ev_timer_start(main_loop, xcb_timer);
+        ev_timer_init(&gif_timer, gif_anim_loop, gif_img[0].delay_sec, 0.);
+        ev_timer_start(main_loop, &gif_timer);
+        gif_timer_started = true;
     }
 
     /* Invoke the event callback once to catch all the events which were
      * received up until now. ev will only pick up new events (when the X11
      * file descriptor becomes readable). */
-    ev_invoke(main_loop, xcb_check, 0);
+    ev_invoke(main_loop, &xcb_check, 0);
 
     if (show_clock || bar_enabled || slideshow_enabled) {
         if (redraw_thread) {
-            struct timespec ts;
+            start_redraw_async(main_loop);
             double s;
             double ns = modf(refresh_rate, &s);
-            ts.tv_sec = (time_t) s;
-            ts.tv_nsec = ns * NANOSECONDS_IN_SECOND;
-            (void) pthread_create(&draw_thread, NULL, start_time_redraw_tick_pthread, (void*) &ts);
-        } else {
+            struct timespec *redraw_interval = malloc(sizeof(struct timespec));
+            if (redraw_interval == NULL) {
+                redraw_thread = false;
+            } else {
+                redraw_interval->tv_sec = (time_t) s;
+                redraw_interval->tv_nsec = ns * NANOSECONDS_IN_SECOND;
+                if (pthread_create(&draw_thread, NULL, start_time_redraw_tick_pthread, redraw_interval) != 0) {
+                    free(redraw_interval);
+                    redraw_thread = false;
+                } else {
+                    draw_thread_started = true;
+                }
+            }
+        }
+        if (!redraw_thread) {
+            stop_redraw_async(main_loop);
             start_time_redraw_tick(main_loop);
         }
     }
     ev_loop(main_loop, 0);
+
+    if (draw_thread_started) {
+        stop_time_redraw_tick_pthread();
+        pthread_join(draw_thread, NULL);
+    }
+
+    stop_redraw_async(main_loop);
+    stop_time_redraw_tick(main_loop);
+    STOP_TIMER(clear_auth_wrong_timeout);
+    STOP_TIMER(clear_indicator_timeout);
+    STOP_TIMER(discard_passwd_timeout);
+    STOP_TIMER(keypress_feedback_timeout);
+    if (gif_timer_started)
+        ev_timer_stop(main_loop, &gif_timer);
+    ev_prepare_stop(main_loop, &xcb_prepare);
+    ev_check_stop(main_loop, &xcb_check);
+    ev_io_stop(main_loop, &xcb_watcher);
+    destroy_renderer();
+    randr_cleanup();
+
+    if (gif_img) {
+        destroy_gif_images();
+    } else if (img) {
+        cairo_surface_destroy(img);
+    }
+    img = NULL;
+    if (blur_bg_img) {
+        cairo_surface_destroy(blur_bg_img);
+        blur_bg_img = NULL;
+    }
+    for (int i = 0; i < slideshow_image_count; i++)
+        free(img_slideshow[i]);
+    free(slideshow_path);
+    free(bar_heights);
 
 #ifndef __OpenBSD__
     if (pam_cleanup) {

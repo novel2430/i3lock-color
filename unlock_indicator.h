@@ -63,12 +63,19 @@ typedef struct {
     int y_behavior_arg;
 } control_char_config_t;
 
-void render_lock(uint32_t* resolution, xcb_drawable_t drawable);
-void draw_image(uint32_t* resolution, cairo_surface_t* img, cairo_t* xcb_ctx);
 void init_colors_once(void);
+void initialize_renderer(void);
+void renderer_update_monitors(void);
+void renderer_invalidate_background(void);
+void request_redraw(void);
+void redraw_if_needed(void);
 void redraw_screen(void);
+void destroy_renderer(void);
 void clear_indicator(void);
-void start_time_redraw_timeout(void);
 void* start_time_redraw_tick_pthread(void* arg);
+void stop_time_redraw_tick_pthread(void);
+void start_redraw_async(struct ev_loop* main_loop);
+void stop_redraw_async(struct ev_loop* main_loop);
 void start_time_redraw_tick(struct ev_loop* main_loop);
+void stop_time_redraw_tick(struct ev_loop* main_loop);
 #endif

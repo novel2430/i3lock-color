@@ -66,7 +66,8 @@ void randr_init(int *event_base, xcb_window_t root) {
                            XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE |
                                XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE |
                                XCB_RANDR_NOTIFY_MASK_CRTC_CHANGE |
-                               XCB_RANDR_NOTIFY_MASK_OUTPUT_PROPERTY);
+                               XCB_RANDR_NOTIFY_MASK_OUTPUT_PROPERTY |
+                               XCB_RANDR_NOTIFY_MASK_RESOURCE_CHANGE);
 
     xcb_flush(conn);
 }
@@ -268,7 +269,7 @@ void _xinerama_query_screens(void) {
         return;
     }
 
-    for (int screen = 0; screen < xr_screens; screen++) {
+    for (int screen = 0; screen < screens; screen++) {
         resolutions[screen].x = screen_info[screen].x_org;
         resolutions[screen].y = screen_info[screen].y_org;
         resolutions[screen].width = screen_info[screen].width;
@@ -295,4 +296,10 @@ void randr_query(xcb_window_t root) {
     }
 
     _xinerama_query_screens();
+}
+
+void randr_cleanup(void) {
+    free(xr_resolutions);
+    xr_resolutions = NULL;
+    xr_screens = 0;
 }

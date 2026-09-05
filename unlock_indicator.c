@@ -9,10 +9,12 @@
  *
  */
 #include <stdbool.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 #include <xcb/xcb.h>
 #include <xcb/randr.h>
 #include <ev.h>
@@ -62,7 +64,6 @@ extern char *modifier_string;
 
 /* A Cairo surface containing the specified image (-i), if any. */
 extern cairo_surface_t *img;
-extern char *image_path;
 extern char *slideshow_path;
 extern char *img_slideshow[256];
 extern cairo_surface_t *blur_bg_img;
@@ -165,7 +166,7 @@ extern char *layout_text;
 extern char *greeter_text;
 
 bool load_slideshow_images(const char *path);
-cairo_surface_t* load_image(char* image_path);
+cairo_surface_t *load_image_path(const char *path);
 
 /* Whether the failed attempts should be displayed. */
 extern bool show_failed_attempts;
@@ -183,11 +184,82 @@ extern xcb_screen_t *screen;
  * Local variables.
  ******************************************************************************/
 
-/* time stuff */
-static struct ev_periodic *time_redraw_tick;
+typedef struct {
+    double screen_x;
+    double screen_y;
+    double width;
+    double height;
+    double indicator_x;
+    double indicator_y;
+    double time_x;
+    double time_y;
+    double date_x;
+    double date_y;
+    double bar_width;
+    double bar_x;
+    double bar_y;
+    double radius;
+
+    te_expr *indicator_x_expr;
+    te_expr *indicator_y_expr;
+    te_expr *time_x_expr;
+    te_expr *time_y_expr;
+    te_expr *date_x_expr;
+    te_expr *date_y_expr;
+    te_expr *layout_x_expr;
+    te_expr *layout_y_expr;
+    te_expr *status_x_expr;
+    te_expr *status_y_expr;
+    te_expr *verify_x_expr;
+    te_expr *verify_y_expr;
+    te_expr *wrong_x_expr;
+    te_expr *wrong_y_expr;
+    te_expr *modifier_x_expr;
+    te_expr *modifier_y_expr;
+    te_expr *bar_x_expr;
+    te_expr *bar_y_expr;
+    te_expr *bar_width_expr;
+    te_expr *greeter_x_expr;
+    te_expr *greeter_y_expr;
+} layout_cache_t;
+
+typedef struct {
+    xcb_pixmap_t present_pixmap;
+    xcb_pixmap_t background_pixmap;
+    xcb_gcontext_t copy_gc;
+    uint32_t width;
+    uint32_t height;
+    cairo_surface_t *overlay_surface;
+    cairo_t *overlay_ctx;
+    cairo_surface_t *present_surface;
+    cairo_t *present_ctx;
+    Rect *monitors;
+    int monitor_count;
+    layout_cache_t layout;
+    ev_periodic time_redraw_tick;
+    ev_async redraw_async;
+    bool time_redraw_tick_initialized;
+    bool redraw_async_initialized;
+    bool expressions_initialized;
+    bool background_dirty;
+    bool redraw_pending;
+    pthread_mutex_t mutex;
+} render_state_t;
+
+static render_state_t renderer = {
+    .present_pixmap = XCB_NONE,
+    .background_pixmap = XCB_NONE,
+    .copy_gc = XCB_NONE,
+    .background_dirty = true,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+};
 
 /* Cache the screen’s visual, necessary for creating a Cairo context. */
 static xcb_visualtype_t *vistype;
+
+static pthread_mutex_t redraw_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t redraw_thread_cond = PTHREAD_COND_INITIALIZER;
+static bool redraw_thread_stop;
 
 int current_slideshow_index = 0;
 
@@ -319,7 +391,7 @@ static cairo_font_face_t *get_font_face(int which) {
      */
     cairo_font_face_t *face = cairo_ft_font_face_create_for_pattern(pattern_ready);
     FcPatternDestroy(pattern_ready);
-    font_faces[which] = cairo_font_face_reference(face);
+    font_faces[which] = face;
     FcFini();
     return face;
 }
@@ -713,6 +785,96 @@ static te_expr *compile_expression(const char *const from, const char *expressio
     return expr;
 }
 
+static void initialize_expressions(void) {
+    layout_cache_t *layout = &renderer.layout;
+    const te_variable variables[] = {
+        {"w", &layout->width, TE_VARIABLE, NULL},
+        {"h", &layout->height, TE_VARIABLE, NULL},
+        {"x", &layout->screen_x, TE_VARIABLE, NULL},
+        {"y", &layout->screen_y, TE_VARIABLE, NULL},
+        {"ix", &layout->indicator_x, TE_VARIABLE, NULL},
+        {"iy", &layout->indicator_y, TE_VARIABLE, NULL},
+        {"tx", &layout->time_x, TE_VARIABLE, NULL},
+        {"ty", &layout->time_y, TE_VARIABLE, NULL},
+        {"dx", &layout->date_x, TE_VARIABLE, NULL},
+        {"dy", &layout->date_y, TE_VARIABLE, NULL},
+        {"bw", &layout->bar_width, TE_VARIABLE, NULL},
+        {"bx", &layout->bar_x, TE_VARIABLE, NULL},
+        {"by", &layout->bar_y, TE_VARIABLE, NULL},
+        {"r", &layout->radius, TE_VARIABLE, NULL},
+    };
+    const int variable_count = sizeof(variables) / sizeof(variables[0]);
+
+    layout->indicator_x_expr = compile_expression("--indpos", ind_x_expr, variables, variable_count);
+    layout->indicator_y_expr = compile_expression("--indpos", ind_y_expr, variables, variable_count);
+    layout->time_x_expr = compile_expression("--timepos", time_x_expr, variables, variable_count);
+    layout->time_y_expr = compile_expression("--timepos", time_y_expr, variables, variable_count);
+    layout->date_x_expr = compile_expression("--datepos", date_x_expr, variables, variable_count);
+    layout->date_y_expr = compile_expression("--datepos", date_y_expr, variables, variable_count);
+    layout->layout_x_expr = compile_expression("--layoutpos", layout_x_expr, variables, variable_count);
+    layout->layout_y_expr = compile_expression("--layoutpos", layout_y_expr, variables, variable_count);
+    layout->status_x_expr = compile_expression("--statuspos", status_x_expr, variables, variable_count);
+    layout->status_y_expr = compile_expression("--statuspos", status_y_expr, variables, variable_count);
+    layout->verify_x_expr = compile_expression("--verifpos", verif_x_expr, variables, variable_count);
+    layout->verify_y_expr = compile_expression("--verifpos", verif_y_expr, variables, variable_count);
+    layout->wrong_x_expr = compile_expression("--wrongpos", wrong_x_expr, variables, variable_count);
+    layout->wrong_y_expr = compile_expression("--wrongpos", wrong_y_expr, variables, variable_count);
+    layout->modifier_x_expr = compile_expression("--modifpos", modif_x_expr, variables, variable_count);
+    layout->modifier_y_expr = compile_expression("--modifpos", modif_y_expr, variables, variable_count);
+    layout->bar_x_expr = compile_expression("--bar-position", bar_x_expr, variables, variable_count);
+    layout->bar_y_expr = strlen(bar_y_expr) ? compile_expression("--bar-position", bar_y_expr, variables, variable_count) : NULL;
+    layout->bar_width_expr = strlen(bar_width_expr) ? compile_expression("--bar-width", bar_width_expr, variables, variable_count) : NULL;
+    layout->greeter_x_expr = compile_expression("--greeterpos", greeter_x_expr, variables, variable_count);
+    layout->greeter_y_expr = compile_expression("--greeterpos", greeter_y_expr, variables, variable_count);
+    renderer.expressions_initialized = true;
+}
+
+static void destroy_expressions(void) {
+    layout_cache_t *layout = &renderer.layout;
+    te_expr **expressions[] = {
+        &layout->indicator_x_expr, &layout->indicator_y_expr,
+        &layout->time_x_expr, &layout->time_y_expr,
+        &layout->date_x_expr, &layout->date_y_expr,
+        &layout->layout_x_expr, &layout->layout_y_expr,
+        &layout->status_x_expr, &layout->status_y_expr,
+        &layout->verify_x_expr, &layout->verify_y_expr,
+        &layout->wrong_x_expr, &layout->wrong_y_expr,
+        &layout->modifier_x_expr, &layout->modifier_y_expr,
+        &layout->bar_x_expr, &layout->bar_y_expr, &layout->bar_width_expr,
+        &layout->greeter_x_expr, &layout->greeter_y_expr,
+    };
+
+    for (size_t i = 0; i < sizeof(expressions) / sizeof(expressions[0]); i++) {
+        te_free(*expressions[i]);
+        *expressions[i] = NULL;
+    }
+    renderer.expressions_initialized = false;
+}
+
+void renderer_update_monitors(void) {
+    Rect *monitors = NULL;
+
+    if (xr_screens > 0) {
+        monitors = malloc(xr_screens * sizeof(Rect));
+        if (monitors == NULL)
+            return;
+        memcpy(monitors, xr_resolutions, xr_screens * sizeof(Rect));
+    }
+
+    pthread_mutex_lock(&renderer.mutex);
+    free(renderer.monitors);
+    renderer.monitors = monitors;
+    renderer.monitor_count = xr_screens;
+    renderer.background_dirty = true;
+    pthread_mutex_unlock(&renderer.mutex);
+}
+
+void initialize_renderer(void) {
+    if (!renderer.expressions_initialized)
+        initialize_expressions();
+    renderer_update_monitors();
+}
+
 static DrawData create_draw_data() {
     DrawData draw_data;
     memset(&draw_data, 0, sizeof(DrawData));
@@ -763,61 +925,113 @@ static void draw_elements(cairo_t *const ctx, DrawData const *const draw_data) {
     draw_text(ctx, draw_data->greeter_text);
 }
 
-/*
- * Renders the lock screen on the provided drawable with the given resolution.
- */
-void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
+static void draw_image(cairo_surface_t *image, cairo_t *ctx);
+
+static void evaluate_layout(DrawData *draw_data, const Rect *monitor,
+                            double scaling_factor, bool use_indicator_expression) {
+    layout_cache_t *layout = &renderer.layout;
+
+    layout->width = monitor->width / scaling_factor;
+    layout->height = monitor->height / scaling_factor;
+    layout->screen_x = monitor->x / scaling_factor;
+    layout->screen_y = monitor->y / scaling_factor;
+    layout->indicator_x = 0;
+    layout->indicator_y = 0;
+    layout->time_x = 0;
+    layout->time_y = 0;
+    layout->date_x = 0;
+    layout->date_y = 0;
+    layout->bar_x = draw_data->bar_x;
+    layout->bar_y = draw_data->bar_y;
+    layout->bar_width = draw_data->bar_width;
+    layout->radius = circle_radius + ring_width;
+
+    draw_data->screen_x = layout->screen_x;
+    draw_data->screen_y = layout->screen_y;
+    if (use_indicator_expression) {
+        layout->indicator_x = te_eval(layout->indicator_x_expr);
+        layout->indicator_y = te_eval(layout->indicator_y_expr);
+    } else {
+        layout->indicator_x = layout->width / 2;
+        layout->indicator_y = layout->height / 2;
+    }
+    draw_data->indicator_x = layout->indicator_x;
+    draw_data->indicator_y = layout->indicator_y;
+
+    layout->time_x = te_eval(layout->time_x_expr);
+    layout->time_y = te_eval(layout->time_y_expr);
+    draw_data->time_text.x = layout->time_x;
+    draw_data->time_text.y = layout->time_y;
+
+    layout->date_x = te_eval(layout->date_x_expr);
+    layout->date_y = te_eval(layout->date_y_expr);
+    draw_data->date_text.x = layout->date_x;
+    draw_data->date_text.y = layout->date_y;
+    draw_data->keylayout_text.x = te_eval(layout->layout_x_expr);
+    draw_data->keylayout_text.y = te_eval(layout->layout_y_expr);
+    draw_data->greeter_text.x = te_eval(layout->greeter_x_expr);
+    draw_data->greeter_text.y = te_eval(layout->greeter_y_expr);
+
+    switch (auth_state) {
+        case STATE_AUTH_VERIFY:
+        case STATE_AUTH_LOCK:
+            draw_data->status_text.x = te_eval(layout->verify_x_expr);
+            draw_data->status_text.y = te_eval(layout->verify_y_expr);
+            break;
+        case STATE_AUTH_WRONG:
+        case STATE_I3LOCK_LOCK_FAILED:
+            draw_data->status_text.x = te_eval(layout->wrong_x_expr);
+            draw_data->status_text.y = te_eval(layout->wrong_y_expr);
+            break;
+        default:
+            draw_data->status_text.x = te_eval(layout->status_x_expr);
+            draw_data->status_text.y = te_eval(layout->status_y_expr);
+            break;
+    }
+
+    draw_data->mod_text.x = te_eval(layout->modifier_x_expr);
+    draw_data->mod_text.y = te_eval(layout->modifier_y_expr);
+
+    if (layout->bar_y_expr) {
+        layout->bar_x = te_eval(layout->bar_x_expr);
+        layout->bar_y = te_eval(layout->bar_y_expr);
+    } else {
+        double bar_offset = te_eval(layout->bar_x_expr);
+        if (bar_orientation == BAR_VERT) {
+            layout->bar_x = bar_offset;
+            layout->bar_y = layout->screen_y;
+        } else {
+            layout->bar_x = layout->screen_x;
+            layout->bar_y = bar_offset;
+        }
+    }
+    if (layout->bar_width_expr)
+        layout->bar_width = te_eval(layout->bar_width_expr);
+    else if (bar_orientation == BAR_VERT)
+        layout->bar_width = layout->height;
+    else
+        layout->bar_width = layout->width;
+
+    draw_data->bar_x = layout->bar_x;
+    draw_data->bar_y = layout->bar_y;
+    draw_data->bar_width = layout->bar_width;
+}
+
+/* Draw the dynamic lock state into the persistent transparent overlay. */
+static void render_lock(void) {
     const double scaling_factor = get_dpi_value() / 96.0;
     int button_diameter_physical = ceil(scaling_factor * BUTTON_DIAMETER);
     DEBUG("scaling_factor is %.f, physical diameter is %d px\n",
         scaling_factor, button_diameter_physical);
 
-    if (!vistype)
-        vistype = get_visualtype_by_depth(32, screen);
-    /* Initialize cairo: Create one in-memory surface to render the unlock
-     * indicator on, create one XCB surface to actually draw (one or more,
-     * depending on the amount of screens) unlock indicators on.
-     * create two more surfaces for time and date display
-     */
-    cairo_surface_t *output = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, resolution[0], resolution[1]);
-    cairo_t *ctx = cairo_create(output);
+    cairo_t *ctx = renderer.overlay_ctx;
+    cairo_identity_matrix(ctx);
+    cairo_reset_clip(ctx);
+    cairo_new_path(ctx);
+    cairo_set_operator(ctx, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(ctx);
+    cairo_set_operator(ctx, CAIRO_OPERATOR_OVER);
     cairo_scale(ctx, scaling_factor, scaling_factor);
-
-    //    cairo_set_font_face(ctx, get_font_face(0));
-
-    cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, drawable, vistype, resolution[0], resolution[1]);
-    cairo_t *xcb_ctx = cairo_create(xcb_output);
-
-    /*update image according to the slideshow_interval*/
-    if (slideshow_image_count > 0) {
-        unsigned long now = (unsigned long)time(NULL);
-        if (img == NULL || now - lastCheck >= slideshow_interval) {
-            if (slideshow_random_selection) {
-                img = load_image(img_slideshow[rand() % slideshow_image_count]);
-            } else {
-                img = load_image(img_slideshow[current_slideshow_index]);
-            }
-            current_slideshow_index++;
-            if (current_slideshow_index >= slideshow_image_count) {
-                current_slideshow_index = 0;
-                load_slideshow_images(slideshow_path);
-            }
-            lastCheck = now;
-        }
-    }
-
-    if (blur_bg_img) {
-        cairo_set_source_surface(xcb_ctx, blur_bg_img, 0, 0);
-        cairo_paint(xcb_ctx);
-    } else {
-        cairo_set_source_rgba(xcb_ctx, background.red, background.green, background.blue, background.alpha);
-        cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-        cairo_fill(xcb_ctx);
-    }
-
-    if (img) {
-        draw_image(resolution, img, xcb_ctx);
-    }
 
     /*
      * gen text
@@ -974,131 +1188,20 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         }
     }
 
-    // initialize positioning vars
-    double screen_x = 0, screen_y = 0,
-           width = 0, height = 0;
-
-    double radius = (circle_radius + ring_width);
     DEBUG("scaling_factor is %f, physical diameter is %d px\n",
           scaling_factor, button_diameter_physical);
 
-    // variable mapping for evaluating the clock position expression
-    const unsigned int vars_size = 14;
-    te_variable vars[] =
-        {{"w", &width},
-         {"h", &height},
-         {"x", &screen_x},
-         {"y", &screen_y},
-         {"ix", &draw_data.indicator_x},
-         {"iy", &draw_data.indicator_y},
-         {"tx", &draw_data.time_text.x},
-         {"ty", &draw_data.time_text.y},
-         {"dx", &draw_data.date_text.x},
-         {"dy", &draw_data.date_text.y},
-         {"bw", &draw_data.bar_width},
-         {"bx", &draw_data.bar_x},
-         {"by", &draw_data.bar_y},
-         {"r", &radius}};
-
-    te_expr *te_ind_x_expr = compile_expression("--indpos", ind_x_expr, vars, vars_size);
-    te_expr *te_ind_y_expr = compile_expression("--indpos", ind_y_expr, vars, vars_size);
-    te_expr *te_time_x_expr = compile_expression("--timepos", time_x_expr, vars, vars_size);
-    te_expr *te_time_y_expr = compile_expression("--timepos", time_y_expr, vars, vars_size);
-    te_expr *te_date_x_expr = compile_expression("--datepos", date_x_expr, vars, vars_size);
-    te_expr *te_date_y_expr = compile_expression("--datepos", date_y_expr, vars, vars_size);
-    te_expr *te_layout_x_expr = compile_expression("--layoutpos", layout_x_expr, vars, vars_size);
-    te_expr *te_layout_y_expr = compile_expression("--layoutpos", layout_y_expr, vars, vars_size);
-    te_expr *te_status_x_expr = compile_expression("--statuspos", status_x_expr, vars, vars_size);
-    te_expr *te_status_y_expr = compile_expression("--statuspos", status_y_expr, vars, vars_size);
-    te_expr *te_verif_x_expr = compile_expression("--verifpos", verif_x_expr, vars, vars_size);
-    te_expr *te_verif_y_expr = compile_expression("--verifpos", verif_y_expr, vars, vars_size);
-    te_expr *te_wrong_x_expr = compile_expression("--wrongpos", wrong_x_expr, vars, vars_size);
-    te_expr *te_wrong_y_expr = compile_expression("--wrongpos", wrong_y_expr, vars, vars_size);
-    te_expr *te_modif_x_expr = compile_expression("--modifpos", modif_x_expr, vars, vars_size);
-    te_expr *te_modif_y_expr = compile_expression("--modifpos", modif_y_expr, vars, vars_size);
-    te_expr *te_bar_x_expr = compile_expression("--bar-position", bar_x_expr, vars, vars_size);
-    te_expr *te_bar_y_expr = strlen(bar_y_expr) ? compile_expression("--bar-position", bar_y_expr, vars, vars_size) : NULL;
-    te_expr *te_bar_width_expr = strlen(bar_width_expr) ? compile_expression("--bar-width", bar_width_expr, vars, vars_size) : NULL;
-
-    te_expr *te_greeter_x_expr = compile_expression("--greeterpos", greeter_x_expr, vars, vars_size);
-    te_expr *te_greeter_y_expr = compile_expression("--greeterpos", greeter_y_expr, vars, vars_size);
-
-    if (xr_screens > 0) {
-        if (screen_number < 0 || screen_number > xr_screens) {
+    if (renderer.monitor_count > 0) {
+        if (screen_number < 0 || screen_number > renderer.monitor_count) {
             screen_number = 0;
         }
 
         DEBUG("Drawing indicator on %d screens\n", screen_number);
 
         int current_screen = screen_number == 0 ? 0 : screen_number - 1;
-        const int end_screen = screen_number == 0 ? xr_screens : screen_number;
+        const int end_screen = screen_number == 0 ? renderer.monitor_count : screen_number;
         for (; current_screen < end_screen; current_screen++) {
-            draw_data.indicator_x = 0;
-            draw_data.indicator_y = 0;
-            draw_data.time_text.x = 0;
-            draw_data.time_text.y = 0;
-            draw_data.date_text.x = 0;
-            draw_data.date_text.y = 0;
-            draw_data.greeter_text.x = 0;
-            draw_data.greeter_text.y = 0;
-
-            width = xr_resolutions[current_screen].width / scaling_factor;
-            height = xr_resolutions[current_screen].height / scaling_factor;
-            screen_x = xr_resolutions[current_screen].x / scaling_factor;
-            screen_y = xr_resolutions[current_screen].y / scaling_factor;
-            draw_data.screen_x = screen_x;
-            draw_data.screen_y = screen_y;
-            draw_data.indicator_x = te_eval(te_ind_x_expr);
-            draw_data.indicator_y = te_eval(te_ind_y_expr);
-            draw_data.time_text.x = te_eval(te_time_x_expr);
-            draw_data.time_text.y = te_eval(te_time_y_expr);
-            draw_data.date_text.x = te_eval(te_date_x_expr);
-            draw_data.date_text.y = te_eval(te_date_y_expr);
-            draw_data.keylayout_text.x = te_eval(te_layout_x_expr);
-            draw_data.keylayout_text.y = te_eval(te_layout_y_expr);
-            draw_data.greeter_text.x = te_eval(te_greeter_x_expr);
-            draw_data.greeter_text.y = te_eval(te_greeter_y_expr);
-
-            switch (auth_state) {
-                case STATE_AUTH_VERIFY:
-                case STATE_AUTH_LOCK:
-                    draw_data.status_text.x = te_eval(te_verif_x_expr);
-                    draw_data.status_text.y = te_eval(te_verif_y_expr);
-                    break;
-                case STATE_AUTH_WRONG:
-                case STATE_I3LOCK_LOCK_FAILED:
-                    draw_data.status_text.x = te_eval(te_wrong_x_expr);
-                    draw_data.status_text.y = te_eval(te_wrong_y_expr);
-                    break;
-                default:
-                    draw_data.status_text.x = te_eval(te_status_x_expr);
-                    draw_data.status_text.y = te_eval(te_status_y_expr);
-                    break;
-            }
-
-            draw_data.mod_text.x = te_eval(te_modif_x_expr);
-            draw_data.mod_text.y = te_eval(te_modif_y_expr);
-
-            if (te_bar_y_expr) {
-                draw_data.bar_x = te_eval(te_bar_x_expr);
-                draw_data.bar_y = te_eval(te_bar_y_expr);
-            } else {
-                double bar_offset = te_eval(te_bar_x_expr);
-                if (bar_orientation == BAR_VERT) {
-                    draw_data.bar_x = bar_offset;
-                    draw_data.bar_y = screen_y;
-                } else {
-                    draw_data.bar_x = screen_x;
-                    draw_data.bar_y = bar_offset;
-                }
-            }
-            if (te_bar_width_expr)
-                draw_data.bar_width = te_eval(te_bar_width_expr);
-            else if (bar_orientation == BAR_VERT)
-                draw_data.bar_width = height;
-            else
-                draw_data.bar_width = width;
-
+            evaluate_layout(&draw_data, &renderer.monitors[current_screen], scaling_factor, true);
 
             DEBUG("Indicator at %fx%f on screen %d\n", draw_data.indicator_x, draw_data.indicator_y, current_screen + 1);
             DEBUG("Bar at %fx%f with width %f on screen %d\n", draw_data.bar_x, draw_data.bar_y, draw_data.bar_width, current_screen + 1);
@@ -1114,59 +1217,8 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         /* We have no information about the screen sizes/positions, so we just
          * place the unlock indicator in the middle of the X root window and
          * hope for the best. */
-        width = last_resolution[0] / scaling_factor;
-        height = last_resolution[1] / scaling_factor;
-        draw_data.screen_x = 0;
-        draw_data.screen_y = 0;
-        draw_data.indicator_x = width / 2;
-        draw_data.indicator_y = height / 2;
-
-        draw_data.time_text.x = te_eval(te_time_x_expr);
-        draw_data.time_text.y = te_eval(te_time_y_expr);
-        draw_data.date_text.x = te_eval(te_date_x_expr);
-        draw_data.date_text.y = te_eval(te_date_y_expr);
-        draw_data.keylayout_text.x = te_eval(te_layout_x_expr);
-        draw_data.keylayout_text.y = te_eval(te_layout_y_expr);
-        draw_data.greeter_text.x = te_eval(te_greeter_x_expr);
-        draw_data.greeter_text.y = te_eval(te_greeter_y_expr);
-        switch (auth_state) {
-            case STATE_AUTH_VERIFY:
-            case STATE_AUTH_LOCK:
-                draw_data.status_text.x = te_eval(te_verif_x_expr);
-                draw_data.status_text.y = te_eval(te_verif_y_expr);
-                break;
-            case STATE_AUTH_WRONG:
-            case STATE_I3LOCK_LOCK_FAILED:
-                draw_data.status_text.x = te_eval(te_wrong_x_expr);
-                draw_data.status_text.y = te_eval(te_wrong_y_expr);
-                break;
-            default:
-                draw_data.status_text.x = te_eval(te_status_x_expr);
-                draw_data.status_text.y = te_eval(te_status_y_expr);
-                break;
-        }
-        draw_data.mod_text.x = te_eval(te_modif_x_expr);
-        draw_data.mod_text.y = te_eval(te_modif_y_expr);
-
-        if (te_bar_y_expr) {
-            draw_data.bar_x = te_eval(te_bar_x_expr);
-            draw_data.bar_y = te_eval(te_bar_y_expr);
-        } else {
-            double bar_offset = te_eval(te_bar_x_expr);
-            if (bar_orientation == BAR_VERT) {
-                draw_data.bar_x = bar_offset;
-                draw_data.bar_y = screen_y;
-            } else {
-                draw_data.bar_x = screen_x;
-                draw_data.bar_y = bar_offset;
-            }
-        }
-        if (te_bar_width_expr)
-            draw_data.bar_width = te_eval(te_bar_width_expr);
-        else if (bar_orientation == BAR_VERT)
-            draw_data.bar_width = height;
-        else
-            draw_data.bar_width = width;
+        const Rect root = {0, 0, renderer.width, renderer.height};
+        evaluate_layout(&draw_data, &root, scaling_factor, false);
 
         DEBUG("Indicator at %fx%f\n", draw_data.indicator_x, draw_data.indicator_y);
         DEBUG("Bar at %fx%f with width %f\n", draw_data.bar_x, draw_data.bar_y, draw_data.bar_width);
@@ -1179,43 +1231,14 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         draw_elements(ctx, &draw_data);
     }
 
-    te_free(te_ind_x_expr);
-    te_free(te_ind_y_expr);
-    te_free(te_time_x_expr);
-    te_free(te_time_y_expr);
-    te_free(te_date_x_expr);
-    te_free(te_date_y_expr);
-    te_free(te_layout_x_expr);
-    te_free(te_layout_y_expr);
-    te_free(te_status_x_expr);
-    te_free(te_status_y_expr);
-    te_free(te_verif_x_expr);
-    te_free(te_verif_y_expr);
-    te_free(te_wrong_x_expr);
-    te_free(te_wrong_y_expr);
-    te_free(te_modif_x_expr);
-    te_free(te_modif_y_expr);
-    te_free(te_bar_x_expr);
-    te_free(te_bar_y_expr);
-    te_free(te_bar_width_expr);
-    te_free(te_greeter_x_expr);
-    te_free(te_greeter_y_expr);
-
-    cairo_set_source_surface(xcb_ctx, output, 0, 0);
-    cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-    cairo_fill(xcb_ctx);
-
-    cairo_surface_destroy(xcb_output);
-    cairo_surface_destroy(output);
-    cairo_destroy(ctx);
-    cairo_destroy(xcb_ctx);
+    cairo_surface_flush(renderer.overlay_surface);
 }
 
 /**
  * Draws the configured image on the provided context. The image is drawn centered on all monitors, tiled, or just
  * painted starting from 0,0. It is also scaled if bg_type is FILL, MAX, or SCALE.
  */
-void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ctx) {
+static void draw_image(cairo_surface_t *img, cairo_t *xcb_ctx) {
 
     if (bg_type == NONE) {
         // Don't do any image manipulation
@@ -1231,19 +1254,19 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
     double image_width = cairo_image_surface_get_width(img);
     double image_height = cairo_image_surface_get_height(img);
 
-    for (int i = 0; i < xr_screens; i++) {
+    for (int i = 0; i < renderer.monitor_count; i++) {
         // Find out scaling factors using bg_type and aspect ratios
         double scale_x = 1, scale_y = 1;
         if (bg_type == SCALE) {
-            scale_x = xr_resolutions[i].width / image_width;
-            scale_y = xr_resolutions[i].height / image_height;
+            scale_x = renderer.monitors[i].width / image_width;
+            scale_y = renderer.monitors[i].height / image_height;
 
         } else if (bg_type == MAX || bg_type == FILL) {
-            double aspect_diff = (double) xr_resolutions[i].height / xr_resolutions[i].width - image_height / image_width;
+            double aspect_diff = (double)renderer.monitors[i].height / renderer.monitors[i].width - image_height / image_width;
             if((bg_type == MAX && aspect_diff >= 0) || (bg_type == FILL && aspect_diff <= 0)) {
-                scale_x = scale_y = xr_resolutions[i].width / image_width;
+                scale_x = scale_y = renderer.monitors[i].width / image_width;
             } else if ((bg_type == MAX && aspect_diff < 0) || (bg_type == FILL && aspect_diff > 0)) {
-                scale_x = scale_y = xr_resolutions[i].height / image_height;
+                scale_x = scale_y = renderer.monitors[i].height / image_height;
             }
         }
 
@@ -1253,36 +1276,215 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
 
         if (bg_type == TILE) {
             // Start image from top-left corner
-            cairo_matrix_translate(&matrix, -xr_resolutions[i].x, -xr_resolutions[i].y);
+            cairo_matrix_translate(&matrix, -renderer.monitors[i].x, -renderer.monitors[i].y);
         } else {
             // Draw image in the center of the screen
             cairo_matrix_translate(&matrix,
-                (image_width  * scale_x - xr_resolutions[i].width ) / 2 - xr_resolutions[i].x,
-                (image_height * scale_y - xr_resolutions[i].height) / 2 - xr_resolutions[i].y);
+                (image_width * scale_x - renderer.monitors[i].width) / 2 - renderer.monitors[i].x,
+                (image_height * scale_y - renderer.monitors[i].height) / 2 - renderer.monitors[i].y);
         }
 
         cairo_pattern_set_matrix(pattern, &matrix);
 
         // Draw to screen
-        cairo_rectangle(xcb_ctx, xr_resolutions[i].x, xr_resolutions[i].y, xr_resolutions[i].width, xr_resolutions[i].height);
+        cairo_rectangle(xcb_ctx, renderer.monitors[i].x, renderer.monitors[i].y,
+                        renderer.monitors[i].width, renderer.monitors[i].height);
         cairo_fill(xcb_ctx);
     }
 
     cairo_pattern_destroy(pattern);
 }
 
-/*
- * Calls render_lock on a new pixmap and swaps that with the current pixmap
- *
- */
+static void destroy_sized_resources(void) {
+    if (renderer.present_ctx)
+        cairo_destroy(renderer.present_ctx);
+    if (renderer.present_surface)
+        cairo_surface_destroy(renderer.present_surface);
+    if (renderer.overlay_ctx)
+        cairo_destroy(renderer.overlay_ctx);
+    if (renderer.overlay_surface)
+        cairo_surface_destroy(renderer.overlay_surface);
+    if (renderer.copy_gc != XCB_NONE)
+        xcb_free_gc(conn, renderer.copy_gc);
+    if (renderer.background_pixmap != XCB_NONE)
+        xcb_free_pixmap(conn, renderer.background_pixmap);
+    if (renderer.present_pixmap != XCB_NONE)
+        xcb_free_pixmap(conn, renderer.present_pixmap);
+
+    renderer.present_ctx = NULL;
+    renderer.present_surface = NULL;
+    renderer.overlay_ctx = NULL;
+    renderer.overlay_surface = NULL;
+    renderer.copy_gc = XCB_NONE;
+    renderer.background_pixmap = XCB_NONE;
+    renderer.present_pixmap = XCB_NONE;
+    renderer.width = 0;
+    renderer.height = 0;
+}
+
+static bool ensure_sized_resources(void) {
+    const uint32_t width = last_resolution[0];
+    const uint32_t height = last_resolution[1];
+    if (renderer.present_pixmap != XCB_NONE &&
+        renderer.width == width && renderer.height == height)
+        return true;
+
+    destroy_sized_resources();
+    if (width == 0 || height == 0)
+        return false;
+
+    if (!vistype)
+        vistype = get_visualtype_by_depth(32, screen);
+    if (!vistype)
+        return false;
+
+    uint32_t resolution[2] = {width, height};
+    DEBUG("rebuilding renderer resources for %u x %u px\n", width, height);
+    renderer.present_pixmap = create_bg_pixmap(conn, win, resolution, color);
+    renderer.background_pixmap = create_bg_pixmap(conn, win, resolution, color);
+    renderer.copy_gc = xcb_generate_id(conn);
+    xcb_create_gc(conn, renderer.copy_gc, renderer.present_pixmap, 0, NULL);
+
+    renderer.overlay_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+    renderer.overlay_ctx = cairo_create(renderer.overlay_surface);
+    renderer.present_surface = cairo_xcb_surface_create(
+        conn, renderer.present_pixmap, vistype, width, height);
+    renderer.present_ctx = cairo_create(renderer.present_surface);
+
+    if (cairo_surface_status(renderer.overlay_surface) != CAIRO_STATUS_SUCCESS ||
+        cairo_status(renderer.overlay_ctx) != CAIRO_STATUS_SUCCESS ||
+        cairo_surface_status(renderer.present_surface) != CAIRO_STATUS_SUCCESS ||
+        cairo_status(renderer.present_ctx) != CAIRO_STATUS_SUCCESS) {
+        DEBUG("could not create renderer Cairo resources\n");
+        destroy_sized_resources();
+        return false;
+    }
+
+    renderer.width = width;
+    renderer.height = height;
+    renderer.background_dirty = true;
+    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP,
+                                 (uint32_t[1]){renderer.present_pixmap});
+    return true;
+}
+
+static void update_slideshow_image(void) {
+    if (slideshow_image_count <= 0)
+        return;
+
+    const unsigned long now = (unsigned long)time(NULL);
+    if (img != NULL && now - lastCheck < (unsigned long)slideshow_interval)
+        return;
+
+    const int index = slideshow_random_selection
+                          ? rand() % slideshow_image_count
+                          : current_slideshow_index;
+    cairo_surface_t *next = load_image_path(img_slideshow[index]);
+    if (next != NULL) {
+        if (img != NULL)
+            cairo_surface_destroy(img);
+        img = next;
+        renderer.background_dirty = true;
+    }
+
+    current_slideshow_index++;
+    if (current_slideshow_index >= slideshow_image_count) {
+        current_slideshow_index = 0;
+        load_slideshow_images(slideshow_path);
+    }
+    lastCheck = now;
+}
+
+static void render_background(void) {
+    cairo_surface_t *surface = cairo_xcb_surface_create(
+        conn, renderer.background_pixmap, vistype, renderer.width, renderer.height);
+    cairo_t *ctx = cairo_create(surface);
+
+    cairo_set_operator(ctx, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(ctx, background.red, background.green,
+                          background.blue, background.alpha);
+    cairo_paint(ctx);
+    cairo_set_operator(ctx, CAIRO_OPERATOR_OVER);
+    if (blur_bg_img) {
+        cairo_set_source_surface(ctx, blur_bg_img, 0, 0);
+        cairo_paint(ctx);
+    }
+    if (img)
+        draw_image(img, ctx);
+
+    cairo_surface_flush(surface);
+    cairo_destroy(ctx);
+    cairo_surface_destroy(surface);
+    renderer.background_dirty = false;
+}
+
+void renderer_invalidate_background(void) {
+    pthread_mutex_lock(&renderer.mutex);
+    renderer.background_dirty = true;
+    pthread_mutex_unlock(&renderer.mutex);
+}
+
+void request_redraw(void) {
+    pthread_mutex_lock(&renderer.mutex);
+    renderer.redraw_pending = true;
+    pthread_mutex_unlock(&renderer.mutex);
+}
+
+void redraw_if_needed(void) {
+    pthread_mutex_lock(&renderer.mutex);
+    const bool pending = renderer.redraw_pending;
+    pthread_mutex_unlock(&renderer.mutex);
+    if (pending)
+        redraw_screen();
+}
+
+/* Present immediately. Authentication uses this before its blocking PAM call. */
 void redraw_screen(void) {
-    DEBUG("redraw_screen(unlock_state = %d, auth_state = %d) @ [%lu]\n", unlock_state, auth_state, (unsigned long)time(NULL));
-    xcb_pixmap_t pixmap = create_bg_pixmap(conn, win, last_resolution, color);
-    render_lock(last_resolution, pixmap);
-    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){pixmap});
-    xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
-    xcb_free_pixmap(conn, pixmap);
+    DEBUG("redraw_screen(unlock_state = %d, auth_state = %d) @ [%lu]\n",
+          unlock_state, auth_state, (unsigned long)time(NULL));
+
+    pthread_mutex_lock(&renderer.mutex);
+    renderer.redraw_pending = false;
+    update_slideshow_image();
+    if (!ensure_sized_resources()) {
+        pthread_mutex_unlock(&renderer.mutex);
+        return;
+    }
+    if (renderer.background_dirty)
+        render_background();
+
+    cairo_surface_flush(renderer.present_surface);
+    xcb_copy_area(conn, renderer.background_pixmap, renderer.present_pixmap,
+                  renderer.copy_gc, 0, 0, 0, 0, renderer.width, renderer.height);
+    cairo_surface_mark_dirty(renderer.present_surface);
+
+    render_lock();
+    cairo_identity_matrix(renderer.present_ctx);
+    cairo_reset_clip(renderer.present_ctx);
+    cairo_set_operator(renderer.present_ctx, CAIRO_OPERATOR_OVER);
+    cairo_set_source_surface(renderer.present_ctx, renderer.overlay_surface, 0, 0);
+    cairo_paint(renderer.present_ctx);
+    cairo_surface_flush(renderer.present_surface);
+
+    xcb_clear_area(conn, 0, win, 0, 0, renderer.width, renderer.height);
     xcb_flush(conn);
+    pthread_mutex_unlock(&renderer.mutex);
+}
+
+void destroy_renderer(void) {
+    pthread_mutex_lock(&renderer.mutex);
+    destroy_sized_resources();
+    destroy_expressions();
+    free(renderer.monitors);
+    renderer.monitors = NULL;
+    renderer.monitor_count = 0;
+    for (size_t i = 0; i < sizeof(font_faces) / sizeof(font_faces[0]); i++) {
+        if (font_faces[i]) {
+            cairo_font_face_destroy(font_faces[i]);
+            font_faces[i] = NULL;
+        }
+    }
+    pthread_mutex_unlock(&renderer.mutex);
 }
 
 /*
@@ -1295,31 +1497,85 @@ void clear_indicator(void) {
         unlock_state = STATE_STARTED;
     } else
         unlock_state = STATE_KEY_PRESSED;
-    redraw_screen();
+    request_redraw();
+}
+
+static void redraw_async_cb(struct ev_loop *loop, ev_async *w, int revents) {
+    redraw_if_needed();
+}
+
+void start_redraw_async(struct ev_loop *main_loop) {
+    if (renderer.redraw_async_initialized)
+        return;
+    ev_async_init(&renderer.redraw_async, redraw_async_cb);
+    ev_async_start(main_loop, &renderer.redraw_async);
+    renderer.redraw_async_initialized = true;
+}
+
+void stop_redraw_async(struct ev_loop *main_loop) {
+    if (renderer.redraw_async_initialized && ev_is_active(&renderer.redraw_async))
+        ev_async_stop(main_loop, &renderer.redraw_async);
+    renderer.redraw_async_initialized = false;
 }
 
 void *start_time_redraw_tick_pthread(void *arg) {
-    struct timespec *ts = (struct timespec *)arg;
-    while (1) {
-        nanosleep(ts, NULL);
-        redraw_screen();
+    const struct timespec interval = *(struct timespec *)arg;
+    free(arg);
+
+    pthread_mutex_lock(&redraw_thread_mutex);
+    while (!redraw_thread_stop) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+            break;
+        deadline.tv_sec += interval.tv_sec;
+        deadline.tv_nsec += interval.tv_nsec;
+        if (deadline.tv_nsec >= NANOSECONDS_IN_SECOND) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= NANOSECONDS_IN_SECOND;
+        }
+
+        int rc = 0;
+        while (!redraw_thread_stop && rc == 0)
+            rc = pthread_cond_timedwait(&redraw_thread_cond, &redraw_thread_mutex, &deadline);
+
+        if (redraw_thread_stop)
+            break;
+        if (rc != ETIMEDOUT)
+            break;
+
+        pthread_mutex_unlock(&redraw_thread_mutex);
+        request_redraw();
+        ev_async_send(EV_DEFAULT, &renderer.redraw_async);
+        pthread_mutex_lock(&redraw_thread_mutex);
     }
+    pthread_mutex_unlock(&redraw_thread_mutex);
+
     return NULL;
 }
 
+void stop_time_redraw_tick_pthread(void) {
+    pthread_mutex_lock(&redraw_thread_mutex);
+    redraw_thread_stop = true;
+    pthread_cond_signal(&redraw_thread_cond);
+    pthread_mutex_unlock(&redraw_thread_mutex);
+}
+
 static void time_redraw_cb(struct ev_loop *loop, ev_periodic *w, int revents) {
-    redraw_screen();
+    request_redraw();
 }
 
 void start_time_redraw_tick(struct ev_loop *main_loop) {
-    if (time_redraw_tick) {
-        ev_periodic_set(time_redraw_tick, 0., refresh_rate, 0);
-        ev_periodic_again(main_loop, time_redraw_tick);
+    if (renderer.time_redraw_tick_initialized) {
+        ev_periodic_set(&renderer.time_redraw_tick, 0., refresh_rate, 0);
+        ev_periodic_again(main_loop, &renderer.time_redraw_tick);
     } else {
-        if (!(time_redraw_tick = calloc(sizeof(struct ev_periodic), 1))) {
-            return;
-        }
-        ev_periodic_init(time_redraw_tick, time_redraw_cb, 0., refresh_rate, 0);
-        ev_periodic_start(main_loop, time_redraw_tick);
+        ev_periodic_init(&renderer.time_redraw_tick, time_redraw_cb, 0., refresh_rate, 0);
+        renderer.time_redraw_tick_initialized = true;
+        ev_periodic_start(main_loop, &renderer.time_redraw_tick);
     }
+}
+
+void stop_time_redraw_tick(struct ev_loop *main_loop) {
+    if (renderer.time_redraw_tick_initialized && ev_is_active(&renderer.time_redraw_tick))
+        ev_periodic_stop(main_loop, &renderer.time_redraw_tick);
 }
